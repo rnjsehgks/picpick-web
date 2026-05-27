@@ -15,6 +15,7 @@ interface ProcessedItem {
   rawBlobModelType?: ModelType;
   resultBlob?: Blob;
   resultUrl?: string;
+  isPartialSelection?: boolean;
   status: 'pending' | 'processing' | 'done' | 'error';
   error?: string;
 }
@@ -31,27 +32,23 @@ const MODE_CONFIG: Record<Mode, { grayscale: boolean; autoCrop: boolean; suffix:
   subject: { grayscale: false, autoCrop: false, suffix: '_누끼' },
 };
 
-// 모드별 사용할 AI 모델 타입
 const MODE_TO_MODEL_TYPE: Record<Mode, ModelType> = {
   'portrait-bw': 'portrait',
   portrait: 'portrait',
   subject: 'subject',
 };
 
-// 모델 타입별 누끼 처리 설정
 function getRemoveBgConfig(
   modelType: ModelType,
   progressCallback: Config['progress'],
 ): Config {
   if (modelType === 'subject') {
-    // 피사체: 큰 모델 + 최고 화질 (제품/사물 엣지 깔끔하게)
     return {
       model: 'isnet',
       output: { format: 'image/png', quality: 1.0 },
       progress: progressCallback,
     };
   }
-  // 인물: 기본 빠른 모델
   return {
     model: 'isnet_fp16',
     output: { format: 'image/png', quality: 0.9 },
@@ -155,6 +152,89 @@ async function applyMode(rawBlob: Blob, mode: Mode): Promise<Blob> {
   return result;
 }
 
+// 클릭한 점이 속한 연결된 피사체 영역만 남기기 (BFS Flood Fill)
+async function floodFillSelect(
+  blob: Blob,
+  clickX: number,
+  clickY: number,
+): Promise<Blob | null> {
+  const img = await createImageBitmap(blob);
+  const W = img.width;
+  const H = img.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, 0, 0);
+
+  const imageData = ctx.getImageData(0, 0, W, H);
+  const data = imageData.data;
+
+  const cx = Math.max(0, Math.min(W - 1, Math.floor(clickX)));
+  const cy = Math.max(0, Math.min(H - 1, Math.floor(clickY)));
+  const startIdx = cy * W + cx;
+
+  // 클릭한 위치가 빈 영역(투명)이면 null 반환 → 호출자가 처리
+  if (data[startIdx * 4 + 3] <= 30) {
+    return null;
+  }
+
+  const visited = new Uint8Array(W * H);
+  const queue = new Int32Array(W * H);
+  let head = 0;
+  let tail = 0;
+
+  queue[tail++] = startIdx;
+  visited[startIdx] = 1;
+
+  while (head < tail) {
+    const idx = queue[head++];
+    const x = idx % W;
+    const y = (idx / W) | 0;
+
+    if (x > 0) {
+      const nidx = idx - 1;
+      if (!visited[nidx] && data[nidx * 4 + 3] > 30) {
+        visited[nidx] = 1;
+        queue[tail++] = nidx;
+      }
+    }
+    if (x < W - 1) {
+      const nidx = idx + 1;
+      if (!visited[nidx] && data[nidx * 4 + 3] > 30) {
+        visited[nidx] = 1;
+        queue[tail++] = nidx;
+      }
+    }
+    if (y > 0) {
+      const nidx = idx - W;
+      if (!visited[nidx] && data[nidx * 4 + 3] > 30) {
+        visited[nidx] = 1;
+        queue[tail++] = nidx;
+      }
+    }
+    if (y < H - 1) {
+      const nidx = idx + W;
+      if (!visited[nidx] && data[nidx * 4 + 3] > 30) {
+        visited[nidx] = 1;
+        queue[tail++] = nidx;
+      }
+    }
+  }
+
+  for (let i = 0; i < W * H; i++) {
+    if (!visited[i]) {
+      data[i * 4 + 3] = 0;
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+
+  return new Promise((resolve) => {
+    canvas.toBlob((b) => resolve(b!), 'image/png');
+  });
+}
+
 export default function Home() {
   const [items, setItems] = useState<ProcessedItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -163,11 +243,11 @@ export default function Home() {
   const [progress, setProgress] = useState('');
   const [statusMessage, setStatusMessage] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
+  const [isSelecting, setIsSelecting] = useState(false);
 
   const selectedItem = items.find((i) => i.id === selectedId);
   const doneCount = items.filter((i) => i.status === 'done').length;
 
-  // 모드 변경 시: 모델 타입이 같으면 후처리만, 다르면 누끼 재처리
   useEffect(() => {
     if (items.length === 0) return;
     if (items.every((i) => !i.rawBlob)) return;
@@ -197,7 +277,6 @@ export default function Home() {
         let newRawBlob = item.rawBlob;
         let newModelType = item.rawBlobModelType;
 
-        // 모델 타입이 다르면 누끼 재처리
         if (item.rawBlobModelType !== currentModelType) {
           try {
             const config = getRemoveBgConfig(currentModelType, (key, current, total) => {
@@ -225,6 +304,7 @@ export default function Home() {
           rawBlobModelType: newModelType,
           resultBlob,
           resultUrl,
+          isPartialSelection: false,
         });
       }
 
@@ -326,6 +406,90 @@ export default function Home() {
     setItems([]);
     setSelectedId(null);
     setStatusMessage('');
+  };
+
+  // 결과 이미지 클릭 → 피사체 선택
+  const handleImageClick = async (e: React.MouseEvent<HTMLImageElement>) => {
+    if (!selectedItem?.resultBlob || isSelecting || processing) return;
+
+    const img = e.currentTarget;
+    const rect = img.getBoundingClientRect();
+    const scaleX = img.naturalWidth / rect.width;
+    const scaleY = img.naturalHeight / rect.height;
+    const x = Math.floor((e.clientX - rect.left) * scaleX);
+    const y = Math.floor((e.clientY - rect.top) * scaleY);
+
+    setIsSelecting(true);
+    setStatusMessage('피사체 선택 중...');
+
+    try {
+      const selectedBlob = await floodFillSelect(selectedItem.resultBlob, x, y);
+
+      if (selectedBlob === null) {
+        setStatusMessage('⚠ 빈 영역입니다. 피사체 위를 클릭하세요.');
+        setIsSelecting(false);
+        return;
+      }
+
+      const newUrl = URL.createObjectURL(selectedBlob);
+      const oldUrl = selectedItem.resultUrl;
+
+      setItems((prev) =>
+        prev.map((p) =>
+          p.id === selectedItem.id
+            ? {
+                ...p,
+                resultBlob: selectedBlob,
+                resultUrl: newUrl,
+                isPartialSelection: true,
+              }
+            : p,
+        ),
+      );
+
+      if (oldUrl) URL.revokeObjectURL(oldUrl);
+      setStatusMessage('✓ 피사체 선택 완료');
+    } catch (err) {
+      console.error(err);
+      setStatusMessage('⚠ 선택 실패');
+    } finally {
+      setIsSelecting(false);
+    }
+  };
+
+  // 전체 결과로 복원
+  const handleResetSelection = async () => {
+    if (!selectedItem?.rawBlob) return;
+
+    setIsSelecting(true);
+    setStatusMessage('전체 결과로 복원 중...');
+
+    try {
+      const fullBlob = await applyMode(selectedItem.rawBlob, mode);
+      const newUrl = URL.createObjectURL(fullBlob);
+      const oldUrl = selectedItem.resultUrl;
+
+      setItems((prev) =>
+        prev.map((p) =>
+          p.id === selectedItem.id
+            ? {
+                ...p,
+                resultBlob: fullBlob,
+                resultUrl: newUrl,
+                isPartialSelection: false,
+              }
+            : p,
+        ),
+      );
+
+      if (oldUrl) URL.revokeObjectURL(oldUrl);
+      setStatusMessage('');
+    } catch (err) {
+      console.error(err);
+      setStatusMessage('⚠ 복원 실패');
+    } finally {
+      setIsSelecting(false);
+    }
   };
 
   const handleDownloadSingle = () => {
@@ -526,12 +690,42 @@ export default function Home() {
                 <div>
                   <p className="text-xs text-gray-500 mb-2">처리 결과</p>
                   {selectedItem?.resultUrl ? (
-                    <img
-                      src={selectedItem.resultUrl}
-                      alt="결과"
-                      className="w-full h-auto rounded-lg border border-gray-100"
-                      style={checkerboardStyle}
-                    />
+                    <>
+                      <div className="relative">
+                        <img
+                          src={selectedItem.resultUrl}
+                          alt="결과"
+                          onClick={handleImageClick}
+                          className={`w-full h-auto rounded-lg border border-gray-100 cursor-crosshair transition ${
+                            isSelecting ? 'opacity-50' : 'hover:opacity-90'
+                          }`}
+                          style={checkerboardStyle}
+                        />
+                        {isSelecting && (
+                          <div className="absolute inset-0 flex items-center justify-center bg-black/30 rounded-lg pointer-events-none">
+                            <span className="text-white text-sm font-medium">
+                              처리 중...
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                      <div className="mt-2 flex items-center justify-between gap-2">
+                        <p className="text-[11px] text-gray-500">
+                          {selectedItem.isPartialSelection
+                            ? '✓ 피사체 선택됨'
+                            : '💡 클릭해서 피사체만 선택'}
+                        </p>
+                        {selectedItem.isPartialSelection && (
+                          <button
+                            onClick={handleResetSelection}
+                            disabled={isSelecting}
+                            className="text-[11px] text-blue-600 hover:underline disabled:opacity-50"
+                          >
+                            전체로 돌아가기
+                          </button>
+                        )}
+                      </div>
+                    </>
                   ) : selectedItem?.status === 'processing' ? (
                     <div className="aspect-[3/4] bg-gray-50 rounded-lg border border-gray-100 flex items-center justify-center text-gray-400 text-sm">
                       처리 중...
