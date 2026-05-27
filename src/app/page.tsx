@@ -1,16 +1,18 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { removeBackground } from '@imgly/background-removal';
+import { removeBackground, type Config } from '@imgly/background-removal';
 import JSZip from 'jszip';
 
 type Mode = 'portrait-bw' | 'portrait' | 'subject';
+type ModelType = 'portrait' | 'subject';
 
 interface ProcessedItem {
   id: string;
   file: File;
   originalUrl: string;
   rawBlob?: Blob;
+  rawBlobModelType?: ModelType;
   resultBlob?: Blob;
   resultUrl?: string;
   status: 'pending' | 'processing' | 'done' | 'error';
@@ -28,6 +30,34 @@ const MODE_CONFIG: Record<Mode, { grayscale: boolean; autoCrop: boolean; suffix:
   portrait: { grayscale: false, autoCrop: true, suffix: '_컬러' },
   subject: { grayscale: false, autoCrop: false, suffix: '_누끼' },
 };
+
+// 모드별 사용할 AI 모델 타입
+const MODE_TO_MODEL_TYPE: Record<Mode, ModelType> = {
+  'portrait-bw': 'portrait',
+  portrait: 'portrait',
+  subject: 'subject',
+};
+
+// 모델 타입별 누끼 처리 설정
+function getRemoveBgConfig(
+  modelType: ModelType,
+  progressCallback: Config['progress'],
+): Config {
+  if (modelType === 'subject') {
+    // 피사체: 큰 모델 + 최고 화질 (제품/사물 엣지 깔끔하게)
+    return {
+      model: 'isnet',
+      output: { format: 'image/png', quality: 1.0 },
+      progress: progressCallback,
+    };
+  }
+  // 인물: 기본 빠른 모델
+  return {
+    model: 'isnet_fp16',
+    output: { format: 'image/png', quality: 0.9 },
+    progress: progressCallback,
+  };
+}
 
 async function smartCropFullPerson(blob: Blob): Promise<Blob> {
   const img = await createImageBitmap(blob);
@@ -137,21 +167,70 @@ export default function Home() {
   const selectedItem = items.find((i) => i.id === selectedId);
   const doneCount = items.filter((i) => i.status === 'done').length;
 
+  // 모드 변경 시: 모델 타입이 같으면 후처리만, 다르면 누끼 재처리
   useEffect(() => {
     if (items.length === 0) return;
     if (items.every((i) => !i.rawBlob)) return;
 
+    const currentModelType = MODE_TO_MODEL_TYPE[mode];
+    const needsReprocessing = items.some(
+      (i) => i.rawBlob && i.rawBlobModelType !== currentModelType,
+    );
+
     (async () => {
-      const updated = await Promise.all(
-        items.map(async (item) => {
-          if (!item.rawBlob) return item;
-          const resultBlob = await applyMode(item.rawBlob, mode);
-          if (item.resultUrl) URL.revokeObjectURL(item.resultUrl);
-          const resultUrl = URL.createObjectURL(resultBlob);
-          return { ...item, resultBlob, resultUrl };
-        }),
-      );
+      if (needsReprocessing) {
+        setProcessing(true);
+        setProgress(
+          currentModelType === 'subject'
+            ? '피사체 전용 모델로 다시 처리 중... (첫 사용 시 모델 다운로드 ~80MB)'
+            : '인물 모델로 다시 처리 중...',
+        );
+      }
+
+      const updated: ProcessedItem[] = [];
+      for (const item of items) {
+        if (!item.rawBlob) {
+          updated.push(item);
+          continue;
+        }
+
+        let newRawBlob = item.rawBlob;
+        let newModelType = item.rawBlobModelType;
+
+        // 모델 타입이 다르면 누끼 재처리
+        if (item.rawBlobModelType !== currentModelType) {
+          try {
+            const config = getRemoveBgConfig(currentModelType, (key, current, total) => {
+              if (key.startsWith('fetch')) {
+                const pct = Math.round((current / total) * 100);
+                setProgress(`AI 모델 다운로드 중... ${pct}%`);
+              }
+            });
+            newRawBlob = await removeBackground(item.file, config);
+            newModelType = currentModelType;
+          } catch (err) {
+            console.error('재처리 실패:', err);
+            updated.push(item);
+            continue;
+          }
+        }
+
+        const resultBlob = await applyMode(newRawBlob, mode);
+        if (item.resultUrl) URL.revokeObjectURL(item.resultUrl);
+        const resultUrl = URL.createObjectURL(resultBlob);
+
+        updated.push({
+          ...item,
+          rawBlob: newRawBlob,
+          rawBlobModelType: newModelType,
+          resultBlob,
+          resultUrl,
+        });
+      }
+
       setItems(updated);
+      setProcessing(false);
+      setProgress('');
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
@@ -170,6 +249,7 @@ export default function Home() {
     }
 
     setProcessing(true);
+    const currentModelType = MODE_TO_MODEL_TYPE[mode];
 
     for (let i = 0; i < newItems.length; i++) {
       const item = newItems[i];
@@ -182,22 +262,28 @@ export default function Home() {
       );
 
       try {
-        const rawBlob = await removeBackground(item.file, {
-          progress: (key, current, total) => {
-            if (key.startsWith('fetch')) {
-              const pct = Math.round((current / total) * 100);
-              setProgress(`AI 모델 다운로드 중... ${pct}%`);
-            }
-          },
+        const config = getRemoveBgConfig(currentModelType, (key, current, total) => {
+          if (key.startsWith('fetch')) {
+            const pct = Math.round((current / total) * 100);
+            setProgress(`AI 모델 다운로드 중... ${pct}%`);
+          }
         });
 
+        const rawBlob = await removeBackground(item.file, config);
         const resultBlob = await applyMode(rawBlob, mode);
         const resultUrl = URL.createObjectURL(resultBlob);
 
         setItems((prev) =>
           prev.map((p) =>
             p.id === item.id
-              ? { ...p, rawBlob, resultBlob, resultUrl, status: 'done' as const }
+              ? {
+                  ...p,
+                  rawBlob,
+                  rawBlobModelType: currentModelType,
+                  resultBlob,
+                  resultUrl,
+                  status: 'done' as const,
+                }
               : p,
           ),
         );
@@ -312,7 +398,6 @@ export default function Home() {
           </p>
         </div>
 
-        {/* STEP 01 */}
         <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mb-4">
           <div className="flex items-center gap-2 mb-4">
             <span className="text-[10px] font-semibold tracking-wider text-gray-500 bg-gray-100 px-2 py-1 rounded">
@@ -378,7 +463,6 @@ export default function Home() {
           )}
         </div>
 
-        {/* STEP 02 */}
         {items.length > 0 && (
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mb-4">
             <div className="flex items-center justify-between mb-4">
@@ -465,7 +549,6 @@ export default function Home() {
           </div>
         )}
 
-        {/* STEP 03 */}
         {doneCount > 0 && (
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
             <div className="flex items-center gap-2 mb-4">
